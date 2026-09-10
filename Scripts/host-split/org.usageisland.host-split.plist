@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.usageisland.host-split</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>$HOME/.local/bin/reparticao-uso</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>USAGE_ISLAND_REMOTE_HOST</key><string>your-server</string>
+  </dict>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/tmp/reparticao-uso.log</string>
+  <key>StandardErrorPath</key><string>/tmp/reparticao-uso.log</string>
+</dict>
+</plist>

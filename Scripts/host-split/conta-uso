@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Conta tokens agregados de Claude, Codex e OpenCode nos registros locais.
+
+A repartição entre hosts é uma estimativa, não uma cota oficial.
+Claude deduplica requestId e conta apenas modelos Claude; Codex deduplica
+response_id e desconta leitura de cache da entrada; OpenCode lê SQLite
+em modo somente-leitura e inclui raciocínio na saída.
+Não exporta conteúdo de conversas nem credenciais.
+"""
+import json
+import os
+import sqlite3
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+
+def parse_ts(texto):
+    if not texto:
+        return None
+    try:
+        return datetime.fromisoformat(texto.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def novo():
+    return {"entrada": 0, "saida": 0, "cache_criado": 0, "tokens": 0, "eventos": 0}
+
+
+def fechar(total):
+    total["tokens"] = total["entrada"] + total["saida"] + total["cache_criado"]
+    return total
+
+
+def varrer_jsonl(raiz, desde, extrair):
+    """Percorre os .jsonl sob `raiz`, entregando cada linha decodificada a `extrair`.
+
+    O mtime permite ignorar arquivos antigos antes de ler seu conteúdo.
+    """
+    total = novo()
+    vistos = set()
+    if not os.path.isdir(raiz):
+        return None
+    for pasta, _, nomes in os.walk(raiz):
+        for nome in nomes:
+            if not nome.endswith(".jsonl"):
+                continue
+            caminho = os.path.join(pasta, nome)
+            try:
+                if os.path.getmtime(caminho) < desde.timestamp():
+                    continue
+            except OSError:
+                continue
+            try:
+                fonte = open(caminho, "r", errors="replace")
+            except OSError:
+                continue
+            with fonte:
+                for linha in fonte:
+                    achado = extrair(linha, desde)
+                    if achado is None:
+                        continue
+                    chave, entrada, saida, cache = achado
+                    if chave in vistos:
+                        continue
+                    vistos.add(chave)
+                    total["eventos"] += 1
+                    total["entrada"] += entrada
+                    total["saida"] += saida
+                    total["cache_criado"] += cache
+    return fechar(total)
+
+
+def claude(linha, desde):
+    if '"usage"' not in linha:
+        return None
+    try:
+        d = json.loads(linha)
+    except ValueError:
+        return None
+    msg = d.get("message") or {}
+    uso = msg.get("usage")
+    if not isinstance(uso, dict):
+        return None
+    if not (msg.get("model") or "").startswith("claude"):
+        return None
+    quando = parse_ts(d.get("timestamp"))
+    if quando is None or quando < desde:
+        return None
+    return (d.get("requestId") or d.get("uuid"),
+            uso.get("input_tokens") or 0,
+            uso.get("output_tokens") or 0,
+            uso.get("cache_creation_input_tokens") or 0)
+
+
+def codex(linha, desde):
+    if "token_usage_record" not in linha:
+        return None
+    try:
+        d = json.loads(linha)
+    except ValueError:
+        return None
+    if d.get("type") != "token_usage_record":
+        return None
+    p = d.get("payload") or {}
+    uso = p.get("usage")
+    if not isinstance(uso, dict):
+        return None
+    quando = parse_ts(d.get("timestamp"))
+    if quando is None or quando < desde:
+        return None
+    entrada = (uso.get("input_tokens") or 0) - (uso.get("cached_input_tokens") or 0)
+    return (p.get("response_id") or d.get("ordinal"),
+            max(0, entrada),
+            uso.get("output_tokens") or 0,
+            uso.get("cache_write_input_tokens") or 0)
+
+
+def opencode(desde):
+    caminho = os.path.expanduser("~/.local/share/opencode/opencode.db")
+    if not os.path.exists(caminho):
+        return None
+    total = novo()
+    corte = int(desde.timestamp() * 1000)
+    try:
+        con = sqlite3.connect(f"file:{caminho}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        cur = con.execute(
+            "select data from message where time_created >= ? and data like '%tokens%'",
+            (corte,))
+        for (bruto,) in cur:
+            try:
+                d = json.loads(bruto)
+            except ValueError:
+                continue
+            t = d.get("tokens")
+            if not isinstance(t, dict):
+                continue
+            cache = t.get("cache") if isinstance(t.get("cache"), dict) else {}
+            total["eventos"] += 1
+            total["entrada"] += t.get("input") or 0
+            total["saida"] += (t.get("output") or 0) + (t.get("reasoning") or 0)
+            total["cache_criado"] += cache.get("write") or 0
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    return fechar(total)
+
+
+def main():
+    dias = 7
+    for arg in sys.argv[1:]:
+        if arg.startswith("--dias="):
+            dias = int(arg.split("=", 1)[1])
+    desde = datetime.now(timezone.utc) - timedelta(days=dias)
+    inicio = time.time()
+    lar = os.path.expanduser("~")
+
+    provedores = {
+        "Claude": varrer_jsonl(os.path.join(lar, ".claude/projects"), desde,
+                               lambda l, d: claude(l, d)),
+        "Codex": varrer_jsonl(os.path.join(lar, ".codex/sessions"), desde,
+                              lambda l, d: codex(l, d)),
+        "OpenCode": opencode(desde),
+    }
+    print(json.dumps({
+        "host": os.uname().nodename,
+        "dias": dias,
+        "desde": desde.isoformat(),
+        "medido_em": datetime.now(timezone.utc).isoformat(),
+        "segundos": round(time.time() - inicio, 2),
+        "provedores": {k: v for k, v in provedores.items() if v is not None},
+    }, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

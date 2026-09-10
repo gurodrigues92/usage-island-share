@@ -1,0 +1,82 @@
+#!/bin/zsh
+# Junta a contagem de tokens do Mac e da vps, por provedor, num arquivinho que a
+# Usage Island le.
+#
+# Nenhum endpoint de cota devolve recorte por maquina — o numero e sempre da CONTA.
+# A repartição so pode ser DEDUZIDA do rastro local de cada CLI, e por isso ela
+# aparece na ilha etiquetada como deduzida, nunca como numero da fonte.
+#
+# Quem abre o ssh e este agendador, nao o app: uma ilha de barra de menus nao pode
+# esperar rede para desenhar. Se a vps nao responder, o arquivo mantem a ultima
+# medida dela e marca ha quanto tempo ela e velha.
+#
+# Use an independent SSH connection for each collection.
+set -u
+: "${USAGE_ISLAND_REMOTE_HOST:?Set USAGE_ISLAND_REMOTE_HOST to your SSH alias}"
+destino="$HOME/.cache/usage-island"
+arquivo="$destino/reparticao.json"
+mkdir -p "$destino"
+
+mac=$("$HOME/.local/bin/conta-uso" 2>/dev/null)
+vps=$(ssh -o BatchMode=yes -o ConnectTimeout=15 -o ControlMaster=no -o ControlPath=none \
+        "$USAGE_ISLAND_REMOTE_HOST" 'conta-uso' 2>/dev/null)
+
+MAC="$mac" VPS="$vps" ANTIGO="$arquivo" python3 - <<'PY' > "$arquivo.tmp" && mv "$arquivo.tmp" "$arquivo"
+import json, os
+from datetime import datetime, timezone
+
+def ler(txt):
+    try:
+        d = json.loads(txt)
+        return d if isinstance(d, dict) and "provedores" in d else None
+    except Exception:
+        return None
+
+mac = ler(os.environ.get("MAC", ""))
+vps = ler(os.environ.get("VPS", ""))
+
+antigo = {}
+try:
+    with open(os.environ["ANTIGO"]) as f:
+        antigo = json.load(f) or {}
+except Exception:
+    antigo = {}
+
+# vps muda: se ela nao respondeu agora, ficam a ultima medida boa e a idade dela.
+# Numero velho identificado e melhor que linha sumindo do card.
+vps_medido = None
+if vps is None:
+    guardado = antigo.get("vps_bruto")
+    if guardado:
+        vps = guardado
+        vps_medido = antigo.get("vps_medido_em")
+if vps is not None and vps_medido is None:
+    vps_medido = vps.get("medido_em")
+
+saida = {
+    "medido_em": datetime.now(timezone.utc).isoformat(),
+    "vps_medido_em": vps_medido,
+    "vps_bruto": vps,
+    "dias": (mac or vps or {}).get("dias", 7),
+    "provedores": {},
+    "completo": mac is not None and vps is not None,
+}
+
+nomes = set((mac or {}).get("provedores", {})) | set((vps or {}).get("provedores", {}))
+for nome in sorted(nomes):
+    tm = ((mac or {}).get("provedores", {}).get(nome) or {}).get("tokens", 0)
+    tv = ((vps or {}).get("provedores", {}).get(nome) or {}).get("tokens", 0)
+    soma = tm + tv
+    # Provedor sem token nenhum nos dois hosts nao rende repartição: 0 de 0 nao e
+    # "meio a meio", e sim "nao ha o que repartir". A linha some do card.
+    if soma <= 0:
+        continue
+    saida["provedores"][nome] = {
+        "mac_tokens": tm,
+        "vps_tokens": tv,
+        "fatia_mac": round(100 * tm / soma, 1),
+        "fatia_vps": round(100 * tv / soma, 1),
+    }
+
+print(json.dumps(saida, separators=(",", ":")))
+PY

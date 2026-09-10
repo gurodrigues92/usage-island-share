@@ -1,0 +1,14 @@
+.DS_Store
+.build/
+dist/
+
+# Local credentials and operational artifacts
+.env
+.env.*
+*.log
+*.p12
+*.pfx
+*.pem
+*.key
+.claude-handoff.md
+work/
