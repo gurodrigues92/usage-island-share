@@ -4,8 +4,8 @@ import Darwin
 import Foundation
 
 /// Uma sessao de agente viva, do jeito que a ilha precisa mostrar.
-struct AgentSession: Identifiable, Equatable {
-    enum State: Equatable {
+struct AgentSession: Identifiable, Equatable, Sendable {
+    enum State: Equatable, Sendable {
         /// Trabalhando agora.
         case busy
         /// Parada esperando voce — o unico estado em que a ilha esta pedindo algo.
@@ -22,6 +22,10 @@ struct AgentSession: Identifiable, Equatable {
     /// Preenchido quando `waiting`: o que ela quer.
     let waitingFor: String?
     let since: Date
+    var processID: Int32? = nil
+    var applicationID: String? = nil
+    var isHeuristic = false
+    var completionConfirmed = false
 }
 
 /// O resumo que o anel desenha: de todas as sessoes vivas, a unica coisa que vale um relance.
@@ -65,6 +69,7 @@ enum ProcessLiveness {
     private static let toleranciaDeReuso: TimeInterval = 5 * 60
 
     static func isAlive(pid: Int32, startedAt: Date?) -> Bool {
+        guard pid > 1 else { return false }
         guard exists(pid: pid) else { return false }
         guard let startedAt, let real = startTime(pid: pid) else {
             // Sem como provar nem desmentir: confiar no pid e melhor que esconder uma
@@ -202,7 +207,8 @@ final class ClaudeSessionMonitor: ObservableObject {
             detail: "\(superficie(json["entrypoint"] as? String)) · \(pasta)",
             state: estado,
             waitingFor: (json["waitingFor"] as? String) ?? (json["needs"] as? String),
-            since: ms.map { Date(timeIntervalSince1970: $0 / 1000) } ?? Date())
+            since: ms.map { Date(timeIntervalSince1970: $0 / 1000) } ?? Date(),
+            processID: pid, completionConfirmed: estado == .idle && bruto == "idle")
     }
 
     static func superficie(_ entrypoint: String?) -> String {

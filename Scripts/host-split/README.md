@@ -15,3 +15,9 @@ Para reproduzir a instalação:
 5. No plist, substitua `your-server` pelo seu alias. Copie o plist para `~/Library/LaunchAgents/` e carregue-o com `launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/org.usageisland.host-split.plist"`.
 
 O contador usa os diretórios padrão das CLIs e conta tokens, não o consumo oficial de cota. Contas em diretórios alternativos não são agregadas automaticamente. Não há credenciais, registros de conversas nem cache de consumo neste diretório.
+
+## Análise por projeto na VPS (opcional)
+
+Instale `Sources/UsageIsland/Resources/usage-analytics.py` do mesmo pacote em `~/.local/share/usage-island/usage-analytics.py` no host configurado. O coletor de repartição consulta esse script em uma etapa independente e preserva a última captura quando houver falha. A saída fica em `~/.cache/usage-island/analytics-vps.json` no Mac. O script é somente leitura dos registros das CLIs e guarda seu próprio ledger privado; não lê credenciais ou envia prompts. O painel identifica a máquina, horário e coleta parcial.
+
+A repartição do cartão usa a definição histórica do coletor de sete dias (sem tokens de leitura de cache); os relatórios de projetos incluem leitura de cache separadamente e agrupam dias em UTC. As duas medidas são identificadas na interface e não representam a fórmula oficial de cota do provedor.

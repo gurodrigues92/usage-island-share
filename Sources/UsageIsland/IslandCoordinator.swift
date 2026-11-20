@@ -1,18 +1,25 @@
 import AppKit
+import Carbon
 import Combine
 import SwiftUI
 
 @MainActor
-final class IslandCoordinator: NSObject {
+final class IslandCoordinator: NSObject, NSWindowDelegate {
     private let model = IslandModel()
     private var panel: NSPanel?
     private var statusItem: NSStatusItem?
     private var subscriptions = Set<AnyCancellable>()
     private var pendingShrink: DispatchWorkItem?
+    private var settingsWindow: NSWindow?
+    private var dashboardWindow: NSWindow?
+    private var hotKey: EventHotKeyRef?
+    private var hotKeyHandler: EventHandlerRef?
+    private var shortcutEnabled = false
+    private var dockDrag: DockDragSession?
 
     func start() {
         let panel = NSPanel(
-            contentRect: NSRect(origin: .zero, size: model.fullMetrics.railHeightSize),
+            contentRect: NSRect(origin: .zero, size: model.dockPanelSize(expanded: false)),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -25,8 +32,13 @@ final class IslandCoordinator: NSObject {
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllApplications, .canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
-        panel.contentView = NSHostingView(rootView: IslandView(model: model))
+        let hosting = IslandHostingView(rootView: IslandView(model: model))
+        hosting.model = model
+        panel.contentView = hosting
         self.panel = panel
+        model.onSettings = { [weak self] in self?.showSettings() }
+        model.onDashboard = { [weak self] in self?.showDashboard() }
+        model.onDockDrag = { [weak self] phase, point in self?.moveDock(phase: phase, point: point) }
 
         // Sem salto de runloop, e com o valor vindo do proprio publisher.
         //
@@ -47,9 +59,20 @@ final class IslandCoordinator: NSObject {
 
         model.$isCompact
             .removeDuplicates()
-            .receive(on: RunLoop.main)
             .sink { [weak self] compact in self?.fadePanel(compact: compact) }
             .store(in: &subscriptions)
+        model.$allSnapshots.map { $0.map(\.id) }.removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.syncPanel() }.store(in: &subscriptions)
+        model.$dockActivity.receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.syncPanel() }.store(in: &subscriptions)
+        model.$previewDockSize.removeDuplicates().sink { [weak self] _ in
+            self?.syncDockAfterPreferenceChange()
+        }.store(in: &subscriptions)
+        model.$selected.removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.syncPanel() }.store(in: &subscriptions)
+        model.settings.$value.sink { [weak self] _ in
+            self?.syncDockAfterPreferenceChange(updateSettings: true)
+        }.store(in: &subscriptions)
 
         NotificationCenter.default.addObserver(
             self,
@@ -57,16 +80,31 @@ final class IslandCoordinator: NSObject {
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
+        for name in [NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(applicationVisibilityChanged), name: name, object: nil)
+        }
 
         model.isPointerOverIsland = { [weak self] in
             guard let panel = self?.panel else { return false }
-            return panel.frame.contains(NSEvent.mouseLocation)
+            guard let self else { return false }
+            guard panel.isVisible else { return false }
+            if self.model.dockDragging { return true }
+            if self.model.dockDetailVisible { return panel.frame.contains(NSEvent.mouseLocation) }
+            let pointer = NSEvent.mouseLocation
+            let rail = IslandPlacement.interactionFrame(in: panel.frame, size: self.model.dockInteractionSize,
+                edge: self.model.settings.value.edge)
+            if rail.contains(pointer) { return true }
+            return self.model.dockNoticeVisible && IslandPlacement.noticeFrame(in: panel.frame,
+                railWidth: self.model.dockInteractionSize.width, height: self.model.dockNoticeHeight,
+                edge: self.model.settings.value.edge, zoom: self.model.dockZoom).contains(pointer)
         }
 
         configureStatusItem()
+        configureMainMenu()
+        configureShortcut()
         syncPanel()
-        panel.alphaValue = model.isCompact ? Self.compactAlpha : 1
-        panel.orderFrontRegardless()
+        panel.alphaValue = model.dockSizeMode == .compact ? model.settings.value.compactOpacity : 1
+        updateDockVisibility()
         model.startRefreshing()
 
         // Screenshot aid: ISLAND_PREVIEW=Claude opens that card immediately.
@@ -86,26 +124,71 @@ final class IslandCoordinator: NSObject {
         }
     }
 
+    // @Published emits before the assignment. Read the committed sizes on the
+    // next turn, including the event-tracking mode used by an active slider.
+    private func syncDockAfterPreferenceChange(updateSettings: Bool = false) {
+        RunLoop.main.perform(inModes: [.common]) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.syncPanel()
+                self.fadePanel(compact: self.model.isCompact)
+                if updateSettings {
+                    self.configureShortcut()
+                    self.settingsWindow?.appearance = self.model.settings.value.theme.appearance
+                    self.dashboardWindow?.appearance = self.model.settings.value.theme.appearance
+                    self.updateDockVisibility()
+                }
+            }
+        }
+    }
+
     @objc private func repositionAfterScreenChange() {
+        if dockDrag != nil { moveDock(phase: .cancel, point: .zero) }
         syncPanel()
     }
 
     @objc private func toggleIsland() {
+        model.settings.edit { $0.dock.enabled.toggle() }
+        updateDockVisibility()
+    }
+
+    @objc private func applicationVisibilityChanged() { updateDockVisibility() }
+
+    private func updateDockVisibility(excluding closedWindow: NSWindow? = nil) {
         guard let panel else { return }
-        if panel.isVisible {
+        let hasAppWindow = [settingsWindow, dashboardWindow].compactMap { $0 }.contains {
+            $0 !== closedWindow && $0.isVisible && !$0.isMiniaturized
+        }
+        let allowed = model.settings.value.dock.enabled &&
+            (model.settings.value.dock.presentation == .overlay || (NSApp.isActive && hasAppWindow))
+        if allowed { panel.orderFrontRegardless() }
+        else {
+            if dockDrag != nil { moveDock(phase: .cancel, point: .zero) }
             panel.orderOut(nil)
-        } else {
-            syncPanel()
-            panel.orderFrontRegardless()
         }
     }
 
+    func windowWillClose(_ notification: Notification) {
+        if notification.object as? NSWindow === settingsWindow { model.previewDockSize = nil }
+        updateDockVisibility(excluding: notification.object as? NSWindow)
+    }
+    func windowDidMiniaturize(_ notification: Notification) {
+        if notification.object as? NSWindow === settingsWindow { model.previewDockSize = nil }
+        updateDockVisibility()
+    }
+    func windowDidDeminiaturize(_ notification: Notification) { updateDockVisibility() }
+    func windowDidBecomeKey(_ notification: Notification) { updateDockVisibility() }
+
     private func configureStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "chart.pie.fill", accessibilityDescription: "Usage Island")
-        item.button?.image?.isTemplate = true
+        item.button?.image = MenuBarIcon.make()
+        item.button?.toolTip = "Usage Island · uso das IAs"
 
         let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Configurações…", action: #selector(showSettings), keyEquivalent: ","))
+        menu.addItem(NSMenuItem(title: "Histórico e projetos…", action: #selector(showDashboard), keyEquivalent: "h"))
+        menu.addItem(NSMenuItem(title: "Atualizar todas as IAs", action: #selector(updateAll), keyEquivalent: "r"))
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Mostrar/Ocultar Usage Island", action: #selector(toggleIsland), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Atualizar uso do SuperGrok agora", action: #selector(updateSuperGrok), keyEquivalent: ""))
         let webBar = NSMenuItem(title: "Mostrar chat web do Grok no card",
@@ -114,8 +197,59 @@ final class IslandCoordinator: NSObject {
         menu.addItem(webBar)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Encerrar Usage Island", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        for row in menu.items where row.action != #selector(NSApplication.terminate(_:)) { row.target = self }
         item.menu = menu
         statusItem = item
+    }
+
+    @objc private func updateAll() { model.refreshNow() }
+    @objc private func showSettings() {
+        if settingsWindow == nil { settingsWindow = window(title: "Usage Island — Configurações", content: SettingsView(model: model), autosave: "UsageIslandSettings", size: NSSize(width: 820, height: 700)) }
+        if let settingsWindow { IslandWindowPresentation.show(settingsWindow) }
+        updateDockVisibility()
+    }
+    @objc private func showDashboard() {
+        if dashboardWindow == nil { dashboardWindow = window(title: "Usage Island — Histórico e projetos", content: DashboardView(model: model), autosave: "UsageIslandDashboard", size: NSSize(width: 900, height: 730)) }
+        if let dashboardWindow { IslandWindowPresentation.show(dashboardWindow) }
+        updateDockVisibility()
+    }
+    private func window<Content: View>(title: String, content: Content, autosave: String, size: NSSize) -> NSWindow {
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.title = title; window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        window.appearance = model.settings.value.theme.appearance
+        window.contentView = NSHostingView(rootView: content)
+        window.minSize = NSSize(width: 780, height: 650)
+        window.center(); window.setFrameAutosaveName(autosave)
+        return window
+    }
+    private func configureMainMenu() {
+        let menu = NSMenu(); let app = NSMenu(); let item = NSMenuItem(); item.submenu = app; menu.addItem(item)
+        let settings = NSMenuItem(title: "Configurações…", action: #selector(showSettings), keyEquivalent: ","); settings.target = self; app.addItem(settings)
+        let dashboard = NSMenuItem(title: "Histórico e projetos…", action: #selector(showDashboard), keyEquivalent: "h"); dashboard.target = self; app.addItem(dashboard)
+        app.addItem(.separator()); app.addItem(NSMenuItem(title: "Encerrar Usage Island", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        NSApp.mainMenu = menu
+    }
+    private func configureShortcut() {
+        let enabled = model.settings.value.shortcutEnabled
+        guard enabled != shortcutEnabled else { return }
+        shortcutEnabled = enabled
+        if let hotKey { UnregisterEventHotKey(hotKey); self.hotKey = nil }
+        guard enabled else { return }
+        if hotKeyHandler == nil {
+            var specification = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
+                guard let context else { return OSStatus(eventNotHandledErr) }
+                let coordinator = Unmanaged<IslandCoordinator>.fromOpaque(context).takeUnretainedValue()
+                MainActor.assumeIsolated { coordinator.toggleIsland() }
+                return noErr
+            }, 1, &specification, Unmanaged.passUnretained(self).toOpaque(), &hotKeyHandler)
+        }
+        let identifier = EventHotKeyID(signature: 0x5549534C, id: 1)
+        if RegisterEventHotKey(UInt32(kVK_ANSI_U), UInt32(controlKey | optionKey), identifier, GetApplicationEventTarget(), 0, &hotKey) != noErr {
+            shortcutEnabled = false; model.settings.edit { $0.shortcutEnabled = false }
+        }
     }
 
     /// Off by default: it is the only reading that needs Arc's cookie, and getting that cookie
@@ -127,7 +261,7 @@ final class IslandCoordinator: NSObject {
             let alert = NSAlert()
             alert.messageText = "Ler a sessão do Grok no Arc?"
             alert.informativeText = """
-            O card do Grok ganha uma barra com o limite do chat web (40 consultas por 2 h). \
+            O card do Grok ganha uma barra com o limite atual do chat web. \
             Para isso o app precisa da chave de cookie do Arc, e o macOS vai pedir sua senha \
             uma vez — escolha "Permitir Sempre". O anel continua funcionando sem isso.
             """
@@ -135,8 +269,9 @@ final class IslandCoordinator: NSObject {
             alert.addButton(withTitle: "Cancelar")
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
-        UserDefaults.standard.set(enabling, forKey: GrokUsageReader.webBarKey)
+        GrokUsageReader.setWebBarEnabled(enabling)
         sender.state = enabling ? .on : .off
+        Task { await model.refreshGrok() }
     }
 
     @objc private func updateSuperGrok() {
@@ -178,14 +313,12 @@ final class IslandCoordinator: NSObject {
     /// tudo — aneis, marcas e numeros — em vez de deixar o desenho opaco boiando sobre um
     /// preto transparente. O valor nao chega a zero de proposito: ilha invisivel e ilha que o
     /// usuario nao acha para trazer de volta.
-    private static let compactAlpha: CGFloat = 0.55
-
     private func fadePanel(compact: Bool) {
         guard let panel else { return }
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.28
+            context.duration = model.settings.value.hoverAnimationDuration
             context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            panel.animator().alphaValue = compact ? Self.compactAlpha : 1
+            panel.animator().alphaValue = model.sizeMode(compact: compact) == .compact && !model.dockDragging ? model.settings.value.compactOpacity : 1
         }
     }
 
@@ -195,7 +328,7 @@ final class IslandCoordinator: NSObject {
     /// shrink waits until the view has finished contracting, over an area that is
     /// transparent by then.
     private func syncPanel(expanded: Bool? = nil) {
-        guard let panel else { return }
+        guard let panel, dockDrag == nil else { return }
         let expandido = expanded ?? model.isExpanded
         let target = targetFrame(expanded: expandido)
         let current = panel.frame
@@ -212,11 +345,11 @@ final class IslandCoordinator: NSObject {
         }
         guard grown != target.size else { return }
         let work = DispatchWorkItem { [weak self] in
-            guard let self, let panel = self.panel else { return }
+            guard let self, let panel = self.panel, self.dockDrag == nil else { return }
             panel.setFrame(self.targetFrame(expanded: expandido), display: true)
         }
         pendingShrink = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + model.settings.value.panelShrinkDelay, execute: work)
     }
 
     /// Always sized for the full rail, even while the island is drawn compact. Resizing the
@@ -224,21 +357,136 @@ final class IslandCoordinator: NSObject {
     /// bounds for an instant, and the black rail visibly came unstuck from the screen edge.
     /// Only the card, which animates on its own, still moves the panel.
     private func targetFrame(expanded: Bool? = nil) -> NSRect {
-        let metrics = model.fullMetrics
-        return centred(NSSize(
-            width: (expanded ?? model.isExpanded) ? metrics.expandedWidth : metrics.railWidth,
-            height: metrics.islandHeight
-        ))
+        centred(model.dockPanelSize(expanded: expanded ?? model.isExpanded))
+    }
+
+    private func moveDock(phase: DockDragPhase, point: NSPoint) {
+        guard let panel else { return }
+        switch phase {
+        case .begin:
+            guard dockDrag == nil, point.x.isFinite, point.y.isFinite,
+                  let screen = panel.screen ?? IslandScreen.choose(model.settings.value.screenID) else { return }
+            pendingShrink?.cancel()
+            dockDrag = DockDragSession(startPoint: point, initialFrame: panel.frame, visibleFrame: screen.visibleFrame)
+            model.dockDragging = true
+            panel.alphaValue = 1
+        case .change:
+            guard let drag = dockDrag else { return }
+            panel.setFrameOrigin(drag.frame(at: point).origin)
+        case .end:
+            guard let drag = dockDrag else { return }
+            let final = drag.frame(at: point)
+            panel.setFrameOrigin(final.origin)
+            // Persist once, after tracking finishes. Intermediate mouse events only move the panel.
+            let position = IslandPlacement.position(for: final, visible: drag.visibleFrame)
+            model.settings.edit { $0.verticalPosition = position }
+            dockDrag = nil
+            model.dockDragging = false
+            syncPanel()
+            fadePanel(compact: model.isCompact)
+        case .cancel:
+            guard let drag = dockDrag else { return }
+            panel.setFrameOrigin(drag.initialFrame.origin)
+            dockDrag = nil
+            model.dockDragging = false
+            syncPanel()
+            fadePanel(compact: model.isCompact)
+        }
     }
 
     /// Flush with the right edge of the screen, centred vertically.
     private func centred(_ size: NSSize) -> NSRect {
-        let visibleFrame = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? .zero
-        return NSRect(
-            x: visibleFrame.maxX - size.width,
-            y: visibleFrame.midY - size.height / 2,
-            width: size.width,
-            height: size.height
-        )
+        let visible = IslandScreen.choose(model.settings.value.screenID)?.visibleFrame ?? .zero
+        return IslandPlacement.frame(size: size, visible: visible, edge: model.settings.value.edge,
+                                     position: model.settings.value.verticalPosition)
+    }
+}
+
+enum IslandPlacement {
+    static func frame(size: NSSize, visible: NSRect, edge: IslandEdge, position: Double) -> NSRect {
+        let height = min(size.height, max(1, visible.height - 24))
+        let width = min(size.width, visible.width)
+        let fraction = position.isFinite ? min(1, max(0, position)) : 0.5
+        return NSRect(x: edge == .left ? visible.minX : visible.maxX - width,
+                      y: visible.minY + (visible.height - height) * (1 - fraction), width: width, height: height)
+    }
+
+    /// Inverse of frame(...). The preference counts from the top while AppKit y grows upward.
+    static func position(for frame: NSRect, visible: NSRect) -> Double {
+        let travel = visible.height - frame.height
+        guard travel.isFinite, travel > 0, frame.minY.isFinite, visible.minY.isFinite else { return 0.5 }
+        return min(1, max(0, Double(1 - (frame.minY - visible.minY) / travel)))
+    }
+
+    static func verticallyMoved(_ frame: NSRect, delta: CGFloat, visible: NSRect) -> NSRect {
+        guard delta.isFinite, visible.minY.isFinite, visible.maxY.isFinite else { return frame }
+        let maximum = max(visible.minY, visible.maxY - frame.height)
+        return NSRect(x: frame.minX, y: min(maximum, max(visible.minY, frame.minY + delta)),
+                      width: frame.width, height: frame.height)
+    }
+
+    /// Shared by native hit testing and the idle watchdog, including the handle and hidden edge strip.
+    static func interactionFrame(in bounds: NSRect, size: NSSize, edge: IslandEdge) -> NSRect {
+        let width = min(bounds.width, max(0, size.width))
+        let height = min(bounds.height, max(0, size.height))
+        return NSRect(x: edge == .left ? bounds.minX : bounds.maxX - width,
+                      y: bounds.midY - height / 2, width: width, height: height)
+    }
+
+    static func noticeFrame(in bounds: NSRect, railWidth: CGFloat, height: CGFloat, edge: IslandEdge, zoom: CGFloat = 1) -> NSRect {
+        let width = (IslandLayout.bubbleWidth + IslandLayout.bubbleArrowDepth) * zoom
+        let height = height * zoom
+        let gap = IslandLayout.bubbleGap * zoom
+        let x = edge == .left ? bounds.minX + railWidth + gap : bounds.maxX - railWidth - gap - width
+        return NSRect(x: x, y: bounds.midY - height / 2, width: width, height: height).intersection(bounds)
+    }
+}
+
+struct DockDragSession {
+    let startPoint: NSPoint
+    let initialFrame: NSRect
+    let visibleFrame: NSRect
+
+    func frame(at point: NSPoint) -> NSRect {
+        IslandPlacement.verticallyMoved(initialFrame, delta: point.y - startPoint.y, visible: visibleFrame)
+    }
+}
+
+@MainActor
+final class IslandHostingView: NSHostingView<IslandView> {
+    weak var model: IslandModel?
+    // Plain SwiftUI buttons otherwise consume the first click to activate a window.
+    // This panel deliberately never activates, so its controls must accept that click.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let model, !model.dockDetailVisible else { return super.hitTest(point) }
+        let rail = IslandPlacement.interactionFrame(in: bounds, size: model.dockInteractionSize, edge: model.settings.value.edge)
+        let notice = model.dockNoticeVisible && IslandPlacement.noticeFrame(in: bounds,
+            railWidth: model.dockInteractionSize.width, height: model.dockNoticeHeight,
+            edge: model.settings.value.edge, zoom: model.dockZoom).contains(point)
+        return rail.contains(point) || notice ? super.hitTest(point) : nil
+    }
+}
+
+@MainActor
+enum IslandWindowPresentation {
+    static func show(_ window: NSWindow) {
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        if !hasVisibleTitlebar(window.frame, screens: NSScreen.screens.map(\.visibleFrame)),
+           let screen = NSScreen.main ?? NSScreen.screens.first {
+            window.setFrameOrigin(NSPoint(x: screen.visibleFrame.midX - window.frame.width / 2,
+                                          y: screen.visibleFrame.midY - window.frame.height / 2))
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
+
+    static func hasVisibleTitlebar(_ frame: NSRect, screens: [NSRect]) -> Bool {
+        let titlebar = NSRect(x: frame.minX, y: frame.maxY - 28, width: frame.width, height: 28)
+        return screens.contains {
+            let overlap = $0.intersection(titlebar)
+            return !overlap.isNull && overlap.width >= min(120, frame.width) && overlap.height >= 20
+        }
     }
 }

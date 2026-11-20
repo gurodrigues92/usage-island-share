@@ -1,12 +1,15 @@
 .DS_Store
 .build/
 dist/
+outputs/
+__pycache__/
 
 # Local credentials and operational artifacts
 .env
 .env.*
 *.log
 *.p12
+*.p8
 *.pfx
 *.pem
 *.key

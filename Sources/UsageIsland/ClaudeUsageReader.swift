@@ -14,13 +14,13 @@ struct ClaudeUsageReader {
         guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return nil }
         let fields = raw.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "|", omittingEmptySubsequences: false)
         guard fields.count >= 2,
-              let epoch = TimeInterval(fields[0]),
-              let percent = Double(fields[1]),
-              (0...100).contains(percent) else { return nil }
+              let epoch = TimeInterval(fields[0]), epoch.isFinite,
+              let percent = UsageValidation.percent(Double(fields[1])) else { return nil }
         let updatedAt = Date(timeIntervalSince1970: epoch)
         // A weekly reset can happen while Claude Code is idle. An old statusline
         // snapshot is less useful than an explicit "awaiting update" state.
-        guard Date().timeIntervalSince(updatedAt) < 6 * 60 * 60 else { return nil }
+        let age = Date().timeIntervalSince(updatedAt)
+        guard age >= -60, age < 6 * 60 * 60 else { return nil }
         return Reading(percentUsed: percent, updatedAt: updatedAt)
     }
 }

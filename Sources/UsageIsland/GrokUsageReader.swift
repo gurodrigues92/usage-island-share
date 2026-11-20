@@ -23,12 +23,20 @@ struct GrokUsageReader {
         let weekly: GrokWeeklyUsage?
         let web: WebLimits?
         let updatedAt: Date
+        var webFailure: String? = nil
     }
 
     /// Optional and disabled by default. Reading Arc cookies requires Keychain
     /// authorization; the weekly quota does not depend on this feature.
     static let webBarKey = "usageIsland.grokWebBar"
     static var isWebBarEnabled: Bool { UserDefaults.standard.bool(forKey: webBarKey) }
+    static func setWebBarEnabled(_ enabled: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(enabled, forKey: webBarKey)
+        defaults.removeObject(forKey: "grokWebCookies")
+        invalidateCookie()
+    }
+
+    static func invalidateCookie() { cachedCookie.withLock { $0 = nil } }
 
     /// One keychain read per launch. The cookie changes only when the user signs in again,
     /// and asking every poll is what turned one dialog into a recurring one.
@@ -37,7 +45,8 @@ struct GrokUsageReader {
     static func read() async -> Reading {
         let weekly = await readWeeklyUsage()
         let web = isWebBarEnabled ? await readWebLimits() : nil
-        return Reading(weekly: weekly, web: web, updatedAt: .now)
+        return Reading(weekly: weekly, web: web, updatedAt: .now,
+                       webFailure: isWebBarEnabled && web == nil ? "Chat web indisponível · confira a sessão no Arc" : nil)
     }
 
     // MARK: - Shared weekly allowance
@@ -51,7 +60,7 @@ struct GrokUsageReader {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.timeoutInterval = 15
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
+        guard let (data, response) = try? await ProviderHTTP.data(for: request, key: "SuperGrok"),
               (response as? HTTPURLResponse)?.statusCode == 200,
               let usage = GrokWeeklyUsage.parse(data) else { return nil }
         return usage
@@ -65,7 +74,7 @@ struct GrokUsageReader {
         guard let entry = authEntry(), let raw = entry["expires_at"] as? String else { return false }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let expires = formatter.date(from: raw) else { return false }
+        guard let expires = formatter.date(from: raw) ?? ISO8601DateFormatter().date(from: raw) else { return false }
         // Dois minutos de folga: token que vence no meio da requisicao volta como 401.
         return expires.timeIntervalSinceNow < 120
     }
@@ -86,17 +95,7 @@ struct GrokUsageReader {
         else { return }
 
         await Task.detached(priority: .utility) {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = ["models"]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            process.standardInput = FileHandle.nullDevice
-            guard (try? process.run()) != nil else { return }
-            let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 25, execute: watchdog)
-            process.waitUntilExit()
-            watchdog.cancel()
+            _ = BoundedProcess.run(executable: executable, arguments: ["models"], timeout: 25)
         }.value
         IslandLog.write(isTokenExpired()
                         ? "Grok: a CLI não renovou o token; uso indisponível"
@@ -126,7 +125,7 @@ struct GrokUsageReader {
     // MARK: - Web chat rate limit
 
     private static func readWebLimits() async -> WebLimits? {
-        guard let cookie = cookieHeaderOncePerLaunch() else { return nil }
+        guard let cookie = await Task.detached(priority: .utility, operation: { cookieHeaderOncePerLaunch() }).value else { return nil }
         var request = URLRequest(url: URL(string: "https://grok.com/rest/rate-limits")!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -136,8 +135,10 @@ struct GrokUsageReader {
         request.httpBody = #"{"requestKind":"DEFAULT","modelName":"grok-4"}"#.data(using: .utf8)
         request.timeoutInterval = 15
 
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200,
+        guard let (data, response) = try? await URLSession.shared.data(for: request) else { return nil }
+        let status = (response as? HTTPURLResponse)?.statusCode
+        if status == 401 || status == 403 { invalidateCookie() }
+        guard status == 200,
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let total = (root["totalQueries"] as? NSNumber)?.intValue, total > 0,
               let remaining = (root["remainingQueries"] as? NSNumber)?.intValue else { return nil }
@@ -147,9 +148,15 @@ struct GrokUsageReader {
     }
 
     private static func cookieHeaderOncePerLaunch() -> String? {
+        cachedCookieHeader(load: grokCookieHeader)
+    }
+
+    static func cachedCookieHeader(load: @Sendable () -> String?) -> String? {
         cachedCookie.withLock { slot in
             if let resolved = slot { return resolved }
-            let header = grokCookieHeader()
+            let header = load()
+            // Do not repeat a denied Keychain prompt in the background. Explicit menu
+            // actions invalidate this cache, allowing retry without a restart.
             slot = .some(header)
             return header
         }
@@ -158,7 +165,11 @@ struct GrokUsageReader {
     /// Arc stores cookies in a Chromium database, values encrypted with a key kept in the
     /// login keychain. Reading that key prompts the user once per signed build of this app —
     /// declining simply means the card loses the web line, never that the ring goes wrong.
+    ///
+    /// Off by default: the Arc key never lists this app, so every launch raised a password
+    /// dialog. The explicit menu action controls this permission-sensitive feature.
     private static func grokCookieHeader() -> String? {
+        guard isWebBarEnabled else { return nil }
         guard let key = cookieEncryptionKey() else { return nil }
         let db = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Arc/User Data/Default/Cookies").path

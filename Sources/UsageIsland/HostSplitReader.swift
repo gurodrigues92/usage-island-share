@@ -26,9 +26,12 @@ struct HostSplit: Equatable {
     /// preserva a ultima medida boa em vez de zerar; sem esta marca, um numero de ontem
     /// passaria por numero de agora.
     let vpsMedidoEm: Date?
+    var isComplete: Bool = true
+    var macMedidoEm: Date? = nil
 
     var resumo: String {
-        "Mac \(Int(macPercent.rounded()))% · VPS \(Int(vpsPercent.rounded()))%"
+        guard isComplete else { return "Dados incompletos" }
+        return "Mac \(Int(macPercent.rounded()))% · VPS \(Int(vpsPercent.rounded()))%"
     }
 
     /// Idade da medida da VPS, em horas, quando ela ja passou de uma hora.
@@ -36,6 +39,16 @@ struct HostSplit: Equatable {
         guard let vpsMedidoEm else { return nil }
         let horas = Int(Date().timeIntervalSince(vpsMedidoEm) / 3600)
         return horas >= 1 ? horas : nil
+    }
+
+    var warning: String? {
+        if !isComplete { return "Coleta incompleta; proporção indisponível" }
+        if vpsMedidoEm == nil { return "VPS sem horário de medição" }
+        if let hours = vpsAtrasoHoras { return "VPS de \(hours)h atrás" }
+        if let macMedidoEm, Date().timeIntervalSince(macMedidoEm) >= 3600 {
+            return "Medida do Mac antiga"
+        }
+        return nil
     }
 }
 
@@ -47,14 +60,27 @@ enum HostSplitReader {
 
     /// Le o arquivo uma vez e devolve a repartição de cada provedor, na chave do card.
     static func read() -> [String: HostSplit] {
-        guard let dados = try? Data(contentsOf: caminho),
+        read(from: caminho)
+    }
+
+    /// Ponto de entrada testável: o coletor grava em `caminho`, os testes passam um fixture.
+    static func read(from url: URL) -> [String: HostSplit] {
+        guard let dados = try? Data(contentsOf: url),
               let raiz = try? JSONSerialization.jsonObject(with: dados) as? [String: Any],
               let provedores = raiz["provedores"] as? [String: Any]
         else { return [:] }
 
         let dias = (raiz["dias"] as? Int) ?? 7
+        guard dias > 0, dias <= 366 else { return [:] }
+        func date(_ value: Any?) -> Date? {
+            guard let text = value as? String else { return nil }
+            let format = ISO8601DateFormatter()
+            format.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            return format.date(from: text) ?? ISO8601DateFormatter().date(from: text)
+        }
         var medido: Date? = nil
-        if let texto = raiz["vps_medido_em"] as? String {
+        // Aceita tanto o formato do coletor distribuído quanto os aliases legados.
+        if let texto = (raiz["netcup_medido_em"] as? String) ?? (raiz["vps_medido_em"] as? String) {
             let formato = ISO8601DateFormatter()
             formato.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             medido = formato.date(from: texto) ?? ISO8601DateFormatter().date(from: texto)
@@ -63,14 +89,19 @@ enum HostSplitReader {
         var saida: [String: HostSplit] = [:]
         for (nome, valor) in provedores {
             guard let bloco = valor as? [String: Any],
-                  let mac = bloco["fatia_mac"] as? Double,
-                  let vps = bloco["fatia_vps"] as? Double
+                  let mac = UsageValidation.percent(json: bloco["fatia_mac"]),
+                  let vps = UsageValidation.percent(json: bloco["fatia_netcup"] ?? bloco["fatia_vps"]),
+                  abs(mac + vps - 100) <= 0.2,
+                  let macTokens = bloco["mac_tokens"] as? Int, macTokens >= 0,
+                  let vpsTokens = (bloco["netcup_tokens"] as? Int) ?? (bloco["vps_tokens"] as? Int), vpsTokens >= 0,
+                  macTokens > 0 || vpsTokens > 0
             else { continue }
             saida[nome] = HostSplit(
                 macPercent: mac, vpsPercent: vps,
-                macTokens: (bloco["mac_tokens"] as? Int) ?? 0,
-                vpsTokens: (bloco["vps_tokens"] as? Int) ?? 0,
-                dias: dias, vpsMedidoEm: medido)
+                macTokens: macTokens, vpsTokens: vpsTokens,
+                dias: dias, vpsMedidoEm: medido,
+                isComplete: ((raiz["completo"] as? Bool) ?? true) && ((bloco["completo"] as? Bool) ?? true),
+                macMedidoEm: date(raiz["mac_medido_em"] ?? raiz["medido_em"]))
         }
         return saida
     }

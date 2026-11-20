@@ -3,11 +3,11 @@ import Testing
 @testable import UsageIsland
 
 struct GrokWeeklyUsageTests {
-    private let now = Date(timeIntervalSince1970: 1_789_027_200) // 2026-09-10 UTC
+    private let now = Date(timeIntervalSince1970: 1_704_326_400) // 2024-01-04 UTC
 
     private func payload(percent: String = "22", type: String = "USAGE_PERIOD_TYPE_WEEKLY",
-                         start: String = "2026-09-07T02:34:21.746490+00:00",
-                         end: String = "2026-09-14T02:34:21.746490+00:00") -> Data {
+                         start: String = "2024-01-01T12:00:00.123456+00:00",
+                         end: String = "2024-01-08T12:00:00.123456+00:00") -> Data {
         Data("""
         {"config":{"creditUsagePercent":\(percent),"currentPeriod":{
         "type":"\(type)","start":"\(start)","end":"\(end)"}}}
@@ -17,7 +17,7 @@ struct GrokWeeklyUsageTests {
     @Test func readsProviderQuotaAndReset() throws {
         let usage = try #require(GrokWeeklyUsage.parse(payload(), now: now))
         #expect(usage.percentUsed == 22)
-        #expect(abs(usage.resetsAt.timeIntervalSince1970 - 1_789_353_261.74649) < 0.001)
+        #expect(abs(usage.resetsAt.timeIntervalSince1970 - 1_704_715_200.123456) < 0.001)
     }
 
     @Test(arguments: ["0", "100", "22.75"])
@@ -38,12 +38,12 @@ struct GrokWeeklyUsageTests {
     }
 
     @Test func rejectsExpiredFutureAndMalformedPeriods() {
-        #expect(GrokWeeklyUsage.parse(payload(end: "2026-09-09T00:00:00Z"), now: now) == nil)
-        #expect(GrokWeeklyUsage.parse(payload(start: "2026-09-11T00:00:00Z"), now: now) == nil)
+        #expect(GrokWeeklyUsage.parse(payload(end: "2024-01-03T00:00:00Z"), now: now) == nil)
+        #expect(GrokWeeklyUsage.parse(payload(start: "2024-01-05T00:00:00Z"), now: now) == nil)
         #expect(GrokWeeklyUsage.parse(payload(end: "unknown"), now: now) == nil)
     }
 
     @Test func acceptsDatesWithoutFractionalSeconds() {
-        #expect(GrokWeeklyUsage.parse(payload(start: "2026-09-07T02:34:21Z", end: "2026-09-14T02:34:21Z"), now: now) != nil)
+        #expect(GrokWeeklyUsage.parse(payload(start: "2024-01-01T12:00:00Z", end: "2024-01-08T12:00:00Z"), now: now) != nil)
     }
 }

@@ -53,7 +53,7 @@ enum ClaudeOAuthReader {
             .max { ($0.modifiedAt ?? .distantPast) < ($1.modifiedAt ?? .distantPast) }
     }
 
-    struct Credentials {
+    struct Credentials: Sendable {
         let accessToken: String
         let expiresAt: Date
         /// "max", "pro"… o plano a que as leituras se referem.
@@ -82,34 +82,29 @@ enum ClaudeOAuthReader {
     /// leitura de verdade — e um token que o Claude Code acabou de rotacionar entra na hora,
     /// sem depender de relogio nenhum.
     actor CredentialCache {
-        private var guardada: Credentials?
-        private var lidoEm: Date?
-        /// Uma leitura de cada vez: enquanto o dialogo esta aberto, o `SecItemCopyMatching`
-        /// nao volta, e comecar outra so empilha dialogo.
-        private var lendo = false
+        private struct Entry {
+            let credentials: Credentials
+            let modifiedAt: Date?
+        }
+        private var entries: [String: Entry] = [:]
+        private let modificationDate: @Sendable (String) -> Date?
+
+        init(modificationDate: @escaping @Sendable (String) -> Date? = { newestItem(service: $0)?.modifiedAt }) {
+            self.modificationDate = modificationDate
+        }
 
         func valor(service: String, ler: (String) throws -> Credentials) throws -> Credentials {
-            let carimbo = ClaudeOAuthReader.newestItem(service: service)?.modifiedAt
-            if let guardada, !guardada.isExpired, carimbo == lidoEm {
-                return guardada
+            let carimbo = modificationDate(service)
+            if let entry = entries[service], !entry.credentials.isExpired, carimbo == entry.modifiedAt {
+                return entry.credentials
             }
-            guard !lendo else {
-                // Ha um pedido em curso (dialogo aberto, provavelmente). Devolver o que
-                // temos, mesmo vencido, e melhor que abrir um segundo dialogo.
-                if let guardada { return guardada }
-                throw CredentialFailure.recusado(errSecInteractionNotAllowed)
-            }
-            lendo = true
-            defer { lendo = false }
             let fresca = try ler(service)
-            guardada = fresca
-            lidoEm = carimbo
+            entries[service] = Entry(credentials: fresca, modifiedAt: carimbo)
             return fresca
         }
 
-        func esquecer() {
-            guardada = nil
-            lidoEm = nil
+        func esquecer(service: String? = nil) {
+            if let service { entries[service] = nil } else { entries = [:] }
         }
     }
 
@@ -118,19 +113,15 @@ enum ClaudeOAuthReader {
     static func readCredentials(service: String) throws -> Credentials {
         guard let winner = newestItem(service: service) else { throw CredentialFailure.ausente }
 
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching([
-            kSecClass: kSecClassGenericPassword,
-            kSecValuePersistentRef: winner.persistentRef,
-            kSecReturnData: true,
-            kSecMatchLimit: kSecMatchLimitOne
-        ] as CFDictionary, &item)
-
-        guard status == errSecSuccess, let data = item as? Data else {
-            // -25320 (`errSecInDarkWake`) e a maquina recem-acordada: desperta o bastante
-            // para rodar tarefa de fundo, nao o bastante para mostrar dialogo. Nao e conta
-            // com problema, e "agora nao" — some sozinho na proxima volta.
-            throw CredentialFailure.recusado(status)
+        _ = winner
+        // O dado sai pelo `/usr/bin/security`, nao pelo `SecItemCopyMatching`. O Claude Code
+        // grava o item com essa mesma ferramenta, e cada rotacao de token reescreve a
+        // particao do item para so `apple-tool:` — o "Sempre Permitir" dado a este app
+        // (`teamid:...`) morria a cada renovacao e o dialogo de senha voltava. O
+        // `/usr/bin/security` esta na lista de acesso e na particao `apple-tool:`, entao le
+        // sem dialogo e sobrevive a rotacao.
+        guard let data = securityCLIPassword(service: service) else {
+            throw CredentialFailure.recusado(errSecAuthFailed)
         }
 
         struct Payload: Decodable {
@@ -154,6 +145,17 @@ enum ClaudeOAuthReader {
         )
     }
 
+    /// `security find-generic-password -s <service> -w`, com teto de 10 s: se o macOS
+    /// resolver mostrar dialogo mesmo assim, o laco nao fica preso nele.
+    static func securityCLIPassword(service: String) -> Data? {
+        guard let result = BoundedProcess.run(executable: "/usr/bin/security",
+            arguments: ["find-generic-password", "-s", service, "-w"], timeout: 10),
+            result.status == 0 else { return nil }
+        var trimmed = result.output
+        while let last = trimmed.last, last == 0x0A || last == 0x0D { trimmed.removeLast() }
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     // MARK: - Endpoint
 
     /// Uma janela de limite, ja com o rotulo em portugues.
@@ -165,6 +167,9 @@ enum ClaudeOAuthReader {
         /// A janela que esta pegando agora, segundo a propria Anthropic.
         let isActive: Bool
         let severity: String?
+        /// Scope, not only category, identifies a provider window.
+        var scopeID: String? = nil
+        var id: String { scopeID.map { "\(kind):\($0)" } ?? kind }
     }
 
     struct Reading {
@@ -186,6 +191,7 @@ enum ClaudeOAuthReader {
                 ?? windows.filter { $0.kind != "session" }.max { $0.percent < $1.percent }
         }
         var weeklies: [Window] { windows.filter { $0.kind != "session" } }
+        var otherWeeklies: [Window] { weeklies.filter { $0.id != geral?.id } }
     }
 
     enum ReadFailure: Error {
@@ -200,23 +206,41 @@ enum ClaudeOAuthReader {
 
     /// 429 seguidos dobram a espera. O endpoint responde `Retry-After: 0`, que obedecido ao
     /// pe da letra e como se continua no limite de taxa.
-    private static let backoff = Backoff()
+    private static let backoffs = BackoffRegistry()
+
+    actor BackoffRegistry {
+        private var accounts: [String: Backoff] = [:]
+        func value(service: String) -> Backoff {
+            if let value = accounts[service] { return value }
+            let value = Backoff(service: service)
+            accounts[service] = value
+            return value
+        }
+    }
 
     /// A punicao sobrevive ao relancamento do app, de proposito.
     ///
     /// Persiste a próxima tentativa e o número de falhas no UserDefaults para evitar
     /// novas requisições durante a espera após reiniciar o aplicativo.
     actor Backoff {
-        private let chaveAte = "usageIsland.claudeBackoffAte"
-        private let chaveSeguidos = "usageIsland.claudeBackoffSeguidos"
+        private let chaveAte: String
+        private let chaveSeguidos: String
+        private let defaults: UserDefaults
+
+        init(service: String = defaultService, suiteName: String? = nil) {
+            let suffix = service == defaultService ? "" : ".\(service)"
+            chaveAte = "usageIsland.claudeBackoffAte" + suffix
+            chaveSeguidos = "usageIsland.claudeBackoffSeguidos" + suffix
+            defaults = suiteName.flatMap(UserDefaults.init(suiteName:)) ?? .standard
+        }
 
         private var until: Date? {
-            get { UserDefaults.standard.object(forKey: chaveAte) as? Date }
-            set { UserDefaults.standard.set(newValue, forKey: chaveAte) }
+            get { defaults.object(forKey: chaveAte) as? Date }
+            set { defaults.set(newValue, forKey: chaveAte) }
         }
         private var seguidos: Int {
-            get { UserDefaults.standard.integer(forKey: chaveSeguidos) }
-            set { UserDefaults.standard.set(newValue, forKey: chaveSeguidos) }
+            get { defaults.integer(forKey: chaveSeguidos) }
+            set { defaults.set(newValue, forKey: chaveSeguidos) }
         }
 
         func esperando() -> Date? {
@@ -245,6 +269,7 @@ enum ClaudeOAuthReader {
     }
 
     static func read(service: String = defaultService) async throws -> Reading {
+        let backoff = await backoffs.value(service: service)
         if let until = await backoff.esperando() { throw ReadFailure.limiteDeTaxa(ate: until) }
 
         let credentials: Credentials
@@ -276,7 +301,7 @@ enum ClaudeOAuthReader {
         if status == 401 || status == 403 {
             // Aceito e recusado: o token vale para outra conta, ou foi revogado. A copia em
             // maos esta errada mesmo sem ter vencido — e o que trocar de conta parece daqui.
-            await cache.esquecer()
+            await cache.esquecer(service: service)
             throw ReadFailure.credencial(.vencido)
         }
         guard (200..<300).contains(status) else { throw ReadFailure.http(status) }
@@ -329,13 +354,18 @@ enum ClaudeOAuthReader {
         }
 
         let resposta = try decoder.decode(Resposta.self, from: data)
+        guard (resposta.limits ?? []).allSatisfy({ UsageValidation.percent($0.percent) != nil }),
+              resposta.fiveHour?.utilization.map({ UsageValidation.percent($0) != nil }) ?? true,
+              resposta.sevenDay?.utilization.map({ UsageValidation.percent($0) != nil }) ?? true else {
+            throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Percentual inválido"))
+        }
         var windows = (resposta.limits ?? []).map { limite in
             Window(kind: limite.kind,
                    label: label(kind: limite.kind, modelo: limite.scope?.model?.displayName),
                    percent: limite.percent,
                    resetsAt: limite.resetsAt,
                    isActive: limite.isActive ?? false,
-                   severity: limite.severity)
+                   severity: limite.severity, scopeID: limite.scope?.model?.displayName)
         }
         func completar(_ janela: Janela?, kind: String, label: String) {
             guard let janela, let uso = janela.utilization,
@@ -345,6 +375,9 @@ enum ClaudeOAuthReader {
         }
         completar(resposta.fiveHour, kind: "session", label: "Sessão atual")
         completar(resposta.sevenDay, kind: "weekly_all", label: "Todos os modelos")
+        guard !windows.isEmpty, Set(windows.map(\.id)).count == windows.count else {
+            throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Janelas ausentes ou duplicadas"))
+        }
         return windows.sorted { ordem($0) < ordem($1) }
     }
 

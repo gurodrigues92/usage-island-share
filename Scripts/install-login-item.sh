@@ -11,9 +11,22 @@
 #     `bootstrap` e redirecionando as tres pontas.
 set -euo pipefail
 
-label=org.usageisland.agent
 app="$HOME/Applications/Usage Island.app"
 binary="$app/Contents/MacOS/UsageIsland"
+label=org.usageisland.agent
+matched_labels=()
+matched_plists=()
+# Reuse an existing agent only when it targets this exact installed executable.
+for candidate_plist in "$HOME/Library/LaunchAgents/"*.plist(N); do
+  if [[ -f "$candidate_plist" ]] && [[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$candidate_plist" 2>/dev/null)" == "$binary" ]]; then
+    candidate="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$candidate_plist")"
+    matched_labels+=("$candidate")
+    matched_plists+=("$candidate_plist")
+  fi
+done
+if (( ${#matched_labels} )); then
+  label="${matched_labels[1]}"
+fi
 plist="$HOME/Library/LaunchAgents/$label.plist"
 log_dir="$HOME/Library/Logs/UsageIsland"
 
@@ -23,6 +36,11 @@ if [[ ! -x "$binary" ]]; then
 fi
 
 mkdir -p "$log_dir" "$HOME/Library/LaunchAgents"
+if [[ -f "$plist" ]]; then
+  backup_dir="${USAGE_ISLAND_BACKUP_DIR:-$HOME/.local/share/usage-island-backups}"
+  mkdir -p "$backup_dir"
+  cp "$plist" "$backup_dir/$label-$(date +%Y%m%d-%H%M%S)-$$.plist"
+fi
 
 cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -66,11 +84,44 @@ cat > "$plist" <<PLIST
 PLIST
 
 domain="gui/$(id -u)"
-launchctl bootout "$domain/$label" 2>/dev/null || true
-launchctl bootstrap "$domain" "$plist" </dev/null >/dev/null 2>&1
+for ((index = 1; index <= ${#matched_labels}; index++)); do
+  candidate="${matched_labels[index]}"
+  candidate_plist="${matched_plists[index]}"
+  launchctl bootout "$domain/$candidate" 2>/dev/null || true
+  if [[ "$candidate" != "$label" ]]; then
+    mv "$candidate_plist" "$candidate_plist.disabled-$(date +%Y%m%d-%H%M%S)"
+  fi
+done
 launchctl enable "$domain/$label"
-launchctl kickstart -k "$domain/$label" </dev/null >/dev/null 2>&1
+# bootout can return before launchd finishes tearing down the old job.
+# Retry the registration briefly and keep the final error visible.
+bootstrap_error="$(mktemp "${TMPDIR:-/tmp}/usage-island-bootstrap-XXXXXX")"
+registered=0
+for attempt in {1..5}; do
+  if launchctl bootstrap "$domain" "$plist" </dev/null >/dev/null 2>"$bootstrap_error"; then
+    registered=1
+    break
+  fi
+  sleep 0.3
+done
+if [[ "$registered" -ne 1 ]]; then
+  cat "$bootstrap_error" >&2
+  rm -f "$bootstrap_error"
+  exit 1
+fi
+rm -f "$bootstrap_error"
+launchctl kickstart "$domain/$label" </dev/null >/dev/null 2>&1
 
 print "Instalado: $plist"
+running=0
+for attempt in {1..30}; do
+  running=$( { pgrep -f "^${binary}$" || true; } | wc -l | tr -d ' ')
+  [[ "$running" -eq 1 ]] && break
+  sleep 0.1
+done
+if [[ "$running" -ne 1 ]]; then
+  print -u2 "Erro: esperado um processo do app instalado; encontrados $running."
+  exit 1
+fi
 print "Logs:      $log_dir"
 print "Parar:     launchctl bootout $domain/$label"

@@ -43,7 +43,7 @@ struct GrokSnapshotTests {
         #expect(value.percentUsed == 26)
         #expect(value.syncState == .live)
         #expect(value.resetText == week.resetText)
-        #expect(value.cardRows == 1)
+        #expect(value.cardRows == 2) // Weekly quota plus the collector source note.
     }
 
     @Test func missingChatDoesNotHideWeeklyQuota() {

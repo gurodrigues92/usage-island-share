@@ -12,6 +12,7 @@
 #
 # Use an independent SSH connection for each collection.
 set -u
+umask 077
 : "${USAGE_ISLAND_REMOTE_HOST:?Set USAGE_ISLAND_REMOTE_HOST to your SSH alias}"
 destino="$HOME/.cache/usage-island"
 arquivo="$destino/reparticao.json"
@@ -34,6 +35,8 @@ def ler(txt):
 
 mac = ler(os.environ.get("MAC", ""))
 vps = ler(os.environ.get("VPS", ""))
+mac_atual = mac is not None
+vps_atual = vps is not None
 
 antigo = {}
 try:
@@ -41,6 +44,9 @@ try:
         antigo = json.load(f) or {}
 except Exception:
     antigo = {}
+
+if mac is None:
+    mac = antigo.get("mac_bruto")
 
 # vps muda: se ela nao respondeu agora, ficam a ultima medida boa e a idade dela.
 # Numero velho identificado e melhor que linha sumindo do card.
@@ -57,21 +63,30 @@ saida = {
     "medido_em": datetime.now(timezone.utc).isoformat(),
     "vps_medido_em": vps_medido,
     "vps_bruto": vps,
+    "mac_bruto": mac,
+    "mac_medido_em": (mac or {}).get("medido_em"),
     "dias": (mac or vps or {}).get("dias", 7),
     "provedores": {},
-    "completo": mac is not None and vps is not None,
+    "completo": mac_atual and vps_atual,
 }
 
 nomes = set((mac or {}).get("provedores", {})) | set((vps or {}).get("provedores", {}))
 for nome in sorted(nomes):
-    tm = ((mac or {}).get("provedores", {}).get(nome) or {}).get("tokens", 0)
-    tv = ((vps or {}).get("provedores", {}).get(nome) or {}).get("tokens", 0)
+    entrada_mac = (mac or {}).get("provedores", {}).get(nome)
+    entrada_vps = (vps or {}).get("provedores", {}).get(nome)
+    tm = (entrada_mac or {}).get("tokens", 0)
+    tv = (entrada_vps or {}).get("tokens", 0)
+    if not isinstance(tm, int) or isinstance(tm, bool) or tm < 0:
+        continue
+    if not isinstance(tv, int) or isinstance(tv, bool) or tv < 0:
+        continue
     soma = tm + tv
     # Provedor sem token nenhum nos dois hosts nao rende repartição: 0 de 0 nao e
     # "meio a meio", e sim "nao ha o que repartir". A linha some do card.
     if soma <= 0:
         continue
     saida["provedores"][nome] = {
+        "completo": mac_atual and vps_atual and entrada_mac is not None and entrada_vps is not None,
         "mac_tokens": tm,
         "vps_tokens": tv,
         "fatia_mac": round(100 * tm / soma, 1),
@@ -80,3 +95,26 @@ for nome in sorted(nomes):
 
 print(json.dumps(saida, separators=(",", ":")))
 PY
+
+# Optional project/model analytics. Its failure preserves the last successful
+# capture and cannot invalidate the quota split above. Install the bundled
+# usage-analytics.py at ~/.local/share/usage-island on the remote host first.
+analytics_tmp="$destino/analytics-vps-$$.tmp"
+if ssh -o BatchMode=yes -o ConnectTimeout=15 -o ControlMaster=no -o ControlPath=none \
+    "$USAGE_ISLAND_REMOTE_HOST" 'python3 "$HOME/.local/share/usage-island/usage-analytics.py" --budget 8388608' \
+    > "$analytics_tmp" 2>/dev/null; then
+    if python3 - "$analytics_tmp" <<'ANALYTICS'
+import json, os, sys
+path = sys.argv[1]
+if os.path.getsize(path) > 4 * 1024 * 1024:
+    raise SystemExit(1)
+with open(path) as f:
+    doc = json.load(f)
+if not isinstance(doc, dict) or not isinstance(doc.get("rows"), list) or not isinstance(doc.get("updatedAt"), str):
+    raise SystemExit(1)
+ANALYTICS
+    then
+        mv "$analytics_tmp" "$destino/analytics-vps.json"
+    fi
+fi
+rm -f "$analytics_tmp"
