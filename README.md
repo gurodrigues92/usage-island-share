@@ -4,11 +4,11 @@ Widget de macOS que mostra as cotas das suas IAs na borda da tela. Passe o mouse
 
 ## Baixar para Mac
 
-[Baixar Usage Island 0.4.3 para macOS](https://github.com/gurodrigues92/usage-island-share/releases/download/v0.4.3/Usage-Island-0.4.3-macOS-universal.zip) · [Todas as versões](https://github.com/gurodrigues92/usage-island-share/releases)
+[Baixar Usage Island 0.4.3 para macOS](https://github.com/gurodrigues92/usage-island-share/releases/download/v0.4.3/Usage-Island-0.4.3-macOS-universal-notarized.zip) · [Todas as versões](https://github.com/gurodrigues92/usage-island-share/releases)
 
 Requer **macOS 14 ou posterior**, em Mac com Apple Silicon ou Intel. Descompacte o ZIP, arraste **Usage Island.app** para **Aplicativos** e abra o app. O ícone de três anéis aparece na barra de menus. A engrenagem da ilha abre as configurações.
 
-O ZIP da versão 0.4.3 contém o app assinado com Developer ID. A notarização da Apple está pendente e o macOS pode bloquear a primeira abertura. A página da versão inclui o SHA-256 para conferir o download. [Orientações da Apple sobre abertura de apps](https://support.apple.com/pt-br/102445).
+A versão 0.4.3 é assinada com Developer ID e notarizada pela Apple. O download acima inclui o ticket para que o Gatekeeper possa verificar a notarização também offline. Para conferir a integridade do ZIP, baixe o [arquivo SHA-256](https://github.com/gurodrigues92/usage-island-share/releases/download/v0.4.3/Usage-Island-0.4.3-macOS-universal-notarized.zip.sha256) na mesma pasta e execute `shasum -a 256 -c Usage-Island-0.4.3-macOS-universal-notarized.zip.sha256`.
 
 Cada integração usa a conta que você configurou no seu Mac. Em **Configurações → Barra**, escolha quais provedores mostrar. Em **Ajustar tamanho**, você pode configurar separadamente a barra em repouso e ao passar o mouse.
 
@@ -97,7 +97,7 @@ open "$HOME/Applications/Usage Island.app"
 
 O script instala o app em `~/Applications`. Ele usa um certificado Developer ID Application disponível no Keychain ou, na ausência dele, uma assinatura ad hoc. Para escolher o certificado, defina `USAGE_ISLAND_SIGN_IDENTITY`. O acesso ao Keychain pode pedir autorização novamente após recompilar com assinatura ad hoc.
 
-Para gerar um ZIP universal separado da instalação local, execute `./Scripts/package-app.sh --archive /tmp/Usage-Island.zip --universal`. Para incluir a notarização da Apple, configure `USAGE_ISLAND_NOTARY_PROFILE` com o nome de um perfil do `notarytool` no Keychain.
+Para gerar um ZIP universal separado da instalação local, execute `./Scripts/package-app.sh --archive /tmp/Usage-Island.zip --universal`. Para notarizar os pacotes desse checkout, salve a credencial com `xcrun notarytool store-credentials` no Chaveiro e registre o nome do perfil com `git config --local usageisland.notaryProfile NOME_DO_PERFIL`. Também é possível escolher o perfil por execução com `USAGE_ISLAND_NOTARY_PROFILE`.
 
 Para abrir o aplicativo com o cartão Claude expandido:
 `ISLAND_PREVIEW=Claude open "$HOME/Applications/Usage Island.app"`.

@@ -104,6 +104,9 @@ if [[ -n "$archive" ]]; then
     : "${USAGE_ISLAND_NOTARY_KEY_ID:?Informe o identificador da chave do App Store Connect}"
     notary_args=(--key "$USAGE_ISLAND_NOTARY_KEY_FILE" --key-id "$USAGE_ISLAND_NOTARY_KEY_ID")
     if [[ -n "${USAGE_ISLAND_NOTARY_ISSUER:-}" ]]; then notary_args+=(--issuer "$USAGE_ISLAND_NOTARY_ISSUER"); fi
+  elif [[ -e "$project_dir/.git" ]]; then
+    profile="$(git -C "$project_dir" config --local --get usageisland.notaryProfile || true)"
+    if [[ -n "$profile" ]]; then notary_args=(--keychain-profile "$profile"); fi
   fi
   pack_zip() {
     /usr/bin/ditto -c -k --keepParent --norsrc --noextattr --noqtn "$app" "$zip"
